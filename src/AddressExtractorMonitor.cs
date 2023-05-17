@@ -9,16 +9,23 @@ namespace MyAddressExtractor {
     public class AddressExtractorMonitor : IAsyncDisposable {
         private readonly Runtime Runtime;
         private Config Config => this.Runtime.Config;
-        private readonly Channel<Line> Channel;
-        private ChannelReader<Line> Reader => this.Channel.Reader;
-        private ChannelWriter<Line> Writer => this.Channel.Writer;
-        private IList<Task> Tasks = new List<Task>();
+
+        private readonly Channel<Line> LineChannel;
+        private ChannelReader<Line> LineReader => this.LineChannel.Reader;
+        private ChannelWriter<Line> LineWriter => this.LineChannel.Writer;
+
+        private readonly Channel<LineResult> EmailChannel;
+        private ChannelReader<LineResult> EmailReader => this.EmailChannel.Reader;
+        private ChannelWriter<LineResult> EmailWriter => this.EmailChannel.Writer;
+
+        private readonly IList<Task> LineTasks = new List<Task>();
+        private readonly Task EmailTask;
 
         private readonly AddressExtractor Extractor;
         private readonly IPerformanceStack Stack;
 
         protected readonly IDictionary<string, Count> Files = new ConcurrentDictionary<string, Count>();
-        protected readonly ConcurrentDictionary<string, byte> Addresses = new(StringComparer.OrdinalIgnoreCase);
+        protected readonly ISet<string> Addresses = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // ReadLine count
         protected int Lines => this.LineCounter;
@@ -38,19 +45,22 @@ namespace MyAddressExtractor {
             TimeSpan iterate
         ) {
             this.Runtime = runtime;
-            this.Channel = this.Config.CreateChannel();
+            this.LineChannel = this.Config.CreateSingleWriterChannel<Line>();
+            this.EmailChannel = this.Config.CreateSingleReaderChannel<LineResult>(1000);
             this.Extractor = new AddressExtractor(runtime);
             this.Stack = stack;
             this.Timer = new Timer(_ => this.Log(), null, iterate, iterate);
 
             for (int i = 0; i < this.Config.Threads; i++)
             {
-                var task = Task.Run(() => this.ReadAsync(this.Runtime.CancellationToken));
-                this.Tasks.Add(task);
+                var task = Task.Run(() => this.ReadLinesAsync(this.Runtime.CancellationToken));
+                this.LineTasks.Add(task);
             }
+
+            this.EmailTask = Task.Run(() => this.ReadEmailsAsync(this.Runtime.CancellationToken));
         }
 
-        private async Task ReadAsync(CancellationToken cancellation)
+        private async Task ReadLinesAsync(CancellationToken cancellation)
         {
             while (!cancellation.IsCancellationRequested)
             {
@@ -62,7 +72,7 @@ namespace MyAddressExtractor {
                     while (!cancellation.IsCancellationRequested)
                     {
                         // Get a line from the Channel
-                        line = await this.Reader.ReadAsync(cancellation);
+                        line = await this.LineReader.ReadAsync(cancellation);
 
                         // Check for pauses
                         await this.Runtime.AwaitContinuationAsync(cancellation);
@@ -70,14 +80,17 @@ namespace MyAddressExtractor {
                         // Extract addresses from the line
                         await foreach(var email in this.Extractor.ExtractAddressesAsync(this.Stack, line.Value, cancellation))
                         {
-                            if (this.Addresses.TryAdd(email, 0))
-                                line.Counter.Increment();
-                            Interlocked.Increment(ref this.LineCounter);
-
-                            // Disabled currently, alternating log messages has oddities
-                            /*if (!this.Config.Quiet && this.Lines % 25000 is 0)
-                                Output.Write($"Checked {this.Lines:n0} lines, found {line.Counter.Value:n0} emails");*/
+                            await this.EmailWriter.WriteAsync(new LineResult {
+                                Address = email,
+                                Counter = line.Counter
+                            }, cancellation);
                         }
+
+                        Interlocked.Increment(ref this.LineCounter);
+
+                        // Disabled currently, alternating log messages has oddities
+                        /*if (!this.Config.Quiet && this.Lines % 25000 is 0)
+                            Output.Write($"Checked {this.Lines:n0} lines, found {line.Counter.Value:n0} emails");*/
                     }
                 } catch (ChannelClosedException) {
                     break; // Break the Task when Channel closed
@@ -88,6 +101,44 @@ namespace MyAddressExtractor {
                         Output.Exception(new Exception($"An error occurred while parsing '{line.File}'L{line.Number}:", ex));
                     else
                         Output.Error($"An error occurred while parsing '{line.File}'L{line.Number}: {ex.Message}");
+
+                    if (!await this.Runtime.WaitOnExceptionAsync(cancellation))
+                        break;
+                }
+            }
+        }
+
+        private async Task ReadEmailsAsync(CancellationToken cancellation)
+        {
+            while (!cancellation.IsCancellationRequested)
+            {
+                LineResult address = default;
+
+                try
+                {
+                    // Task runs forever
+                    while (!cancellation.IsCancellationRequested)
+                    {
+                        // Get an address from the channel
+                        address = await this.EmailReader.ReadAsync(cancellation);
+
+                        // Check for pauses
+                        await this.Runtime.AwaitContinuationAsync(cancellation);
+
+                        if (
+                            !string.IsNullOrEmpty(address.Address)
+                            && this.Addresses.Add(address.Address)
+                        ) address.Counter.Increment();
+                    }
+                } catch (ChannelClosedException) {
+                    break; // Break the Task when Channel closed
+                } catch (TaskCanceledException) {
+                    break; // Break the Task when Tasks are cancelled
+                } catch (Exception ex) {
+                    if (this.Config.Debug)
+                        Output.Exception(new Exception($"An error occurred while storing '{address.Address}':", ex));
+                    else
+                        Output.Error($"An error occurred while storing '{address.Address}': {ex.Message}");
 
                     if (!await this.Runtime.WaitOnExceptionAsync(cancellation))
                         break;
@@ -116,7 +167,7 @@ namespace MyAddressExtractor {
                         stack.Step("Read line");
                         if (line is not null)
                         {
-                            await this.Writer.WriteAsync(new Line {
+                            await this.LineWriter.WriteAsync(new Line {
                                 File = file.FullName,
                                 Value = line,
                                 Counter = count,
@@ -144,9 +195,13 @@ namespace MyAddressExtractor {
 
         internal async ValueTask AwaitCompletionAsync()
         {
-            this.Writer.Complete();
-            await Task.WhenAll(this.Tasks);
-            await this.Reader.Completion;
+            this.LineWriter.Complete();
+
+            await Task.WhenAll(this.LineTasks);
+            this.EmailWriter.Complete();
+            await Task.WhenAll(new[] { this.EmailTask });
+
+            await this.LineReader.Completion;
         }
 
         internal async ValueTask SaveAsync(CancellationToken cancellation = default)
@@ -157,7 +212,7 @@ namespace MyAddressExtractor {
             {
                 await File.WriteAllLinesAsync(
                     output,
-                    this.Addresses.Keys.Select(address => address.ToLowerInvariant())
+                    this.Addresses.Select(address => address.ToLowerInvariant())
                         .OrderBy(address => address, StringComparer.OrdinalIgnoreCase),
                     cancellation
                 );

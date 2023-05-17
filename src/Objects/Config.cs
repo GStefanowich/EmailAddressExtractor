@@ -77,10 +77,17 @@ namespace MyAddressExtractor.Objects {
 
         #endregion
 
-        public Channel<Line> CreateChannel()
-            => Channel.CreateBounded<Line>(new BoundedChannelOptions(this.Threads * 3) {
+        public Channel<T> CreateSingleWriterChannel<T>(int? size = null)
+            => Channel.CreateBounded<T>(new BoundedChannelOptions(size ?? this.Threads * 3) {
                 SingleWriter = true, // Only one instance of `ILineReader` is used at a time
                 SingleReader = false,
+                AllowSynchronousContinuations = false // Require Async
+            });
+
+        public Channel<T> CreateSingleReaderChannel<T>(int? size = null)
+            => Channel.CreateBounded<T>(new BoundedChannelOptions(size ?? this.Threads * 3) {
+                SingleWriter = false, // Only one instance of `ILineReader` is used at a time
+                SingleReader = true,
                 AllowSynchronousContinuations = false // Require Async
             });
 

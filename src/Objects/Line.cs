@@ -11,10 +11,19 @@ namespace MyAddressExtractor.Objects
         /// <summary>The value of the Line</summary>
         public required string Value { get; init; }
 
-        /// <summary>The count of extracted Email Addresses</summary>
+        /// <summary>The count of extracted <see cref="EmailAddress"/>es</summary>
         public required Count Counter { get; init; }
 
         /// <summary>The current line number</summary>
         public required int Number { get; init; }
+    }
+    
+    public struct LineResult
+    {
+        /// <summary>An extracted <see cref="EmailAddress"/></summary>
+        public required string Address { get; init; }
+
+        /// <summary>The count of extracted Email Addresses</summary>
+        public required Count Counter { get; init; }
     }
 }
